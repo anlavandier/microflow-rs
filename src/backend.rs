@@ -1,14 +1,44 @@
+#[derive(Clone, Copy)]
+pub struct Job{
+    #[doc(hidden)]
+    /// Type erased `worker` function
+    func: unsafe fn(*mut ()),
+    #[doc(hidden)]
+    /// Type erased argument to the `worker` function
+    arg: *mut (),
+}
+
+// Safety: Each job works on a exclusive slice of memory of a Send + Sync type
+unsafe impl Send for Job {}
+impl Job {
+
+    /// Create a new job
+    ///
+    /// # Safety
+    /// `arg` has to represent a valid argument for the unsafe `func`
+    ///
+    unsafe fn new(func: unsafe fn(*mut ()), arg: *mut ()) -> Self {
+        Job { func, arg }
+    }
+
+    /// Runs the job and consumes it
+    pub fn run(self) {
+        // SAFETY: this type cannot be constructed outside of this crate
+        // and the safety requirements are forwarded to the struct's construction
+        unsafe { (self.func)(self.arg) };
+    }
+}
 /// Trait for pluggable computation backends.
 ///
 /// A backend controls how the inner computation loops of the inference ops
 /// are scheduled.
-
+///
 /// `defer_job` is given a pointer-sized `arg`. The backend **must** ensure
 /// all deferred closures have completed before `wait` returns and before the
 /// data pointed to by `arg` is dropped or moved.
 pub trait Backend {
     /// Schedule a single unit of work.
-    fn defer_job(func: fn(usize), arg: usize);
+    fn defer_job(job: Job);
 
     /// Block until all jobs previously submitted via [`defer_job`] have completed.
     fn wait();
@@ -20,45 +50,46 @@ pub trait Backend {
     where
         F: Fn(usize, usize) -> T + Sync,
     {
-        // Safety: T is always a quantized integer type (or array thereof) for which
+        // SAFETY: T is always a quantized integer type (or array thereof) for which
         // zero bytes are a valid representation. Workers overwrite every cell before
         // `wait()` returns, so no zeroed value is ever observed.
         let mut output: [[T; ROWS]; COLS] = unsafe { core::mem::zeroed() };
-        let output_ptr = output.as_mut_ptr() as *mut T;
 
-        struct Job<'a, F, T> {
+        struct ParallelizationUnit<'a, F, T, const R: usize> {
             func: &'a F,
-            output_ptr: *mut T,
-            row: usize,
+            output_col: &'a mut [T; R],
+            col: usize,
         }
 
-        let jobs: [Job<'_, F, T>; ROWS] = core::array::from_fn(|row| Job {
-            func: &func,
-            output_ptr,
-            row,
-        });
-
-        fn worker<F, T, const R: usize, const C: usize>(argument: usize)
+        /// Runs a function on a 1 x R column
+        ///
+        /// # Safety
+        ///
+        /// The caller must ensure that `arg` represents pointer to an **initialized** `Job<'_, F, T, R>`
+        ///
+        unsafe fn worker<F, T, const R: usize>(arg: *mut ())
         where
             F: Fn(usize, usize) -> T + Sync,
             T: Send,
         {
-            // Safety: `argument` is a `&Job` erased to `usize` by the caller.
-            // `Backend::wait()` guarantees the worker finishes before `jobs` is dropped.
-            let job = unsafe { &*(argument as *const Job<'_, F, T>) };
-            for column in 0..C {
-                let value = (job.func)(job.row, column);
-                // Safety: each row is owned by exactly one job, so the column-major
-                // index `column * R + job.row` is unique across concurrent writes
-                // and no two threads alias the same address.
-                unsafe {
-                    *job.output_ptr.add(column * R + job.row) = value;
-                }
+            // SAFETY: the safety requirements are forwarded to the caller
+            let job = unsafe {(arg.cast::<ParallelizationUnit<'_, F, T, R>>()).as_mut_unchecked()};
+            for row in 0..R {
+                let value = (job.func)(job.col, row);
+                job.output_col[row] = value ;
             }
         }
 
-        for job in &jobs {
-            Self::defer_job(worker::<F, T, ROWS, COLS>, job as *const _ as usize);
+        for (c_i, column) in output.iter_mut().enumerate() {
+            let mut job = ParallelizationUnit {func: &func, output_col: column, col: c_i} ;
+            Self::defer_job(
+                unsafe {
+                    Job::new(
+                        worker::<F, T, ROWS>,
+                        (core::ptr::from_mut(&mut job)).cast()
+                    )
+                }
+            );
         }
         Self::wait();
 
@@ -72,13 +103,19 @@ pub trait Backend {
 pub struct SequentialBackend;
 
 impl Backend for SequentialBackend {
+    /// This should never be reached because all of the work is done
+    /// in `from_fn`
     #[inline(always)]
-    fn defer_job(func: fn(usize), arg: usize) {
-        func(arg);
+    fn defer_job(_job: Job) {
+        unreachable!()
     }
 
+    /// This should never be reached because all of the work is done
+    /// in `from_fn`
     #[inline(always)]
-    fn wait() {}
+    fn wait() {
+        unreachable!()
+    }
 
     #[inline(always)]
     fn from_fn<T: Send + Copy, F, const ROWS: usize, const COLS: usize>(
