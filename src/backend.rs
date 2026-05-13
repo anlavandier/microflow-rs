@@ -1,5 +1,5 @@
 #[derive(Clone, Copy)]
-pub struct Job{
+pub struct Job {
     #[doc(hidden)]
     /// Type erased `worker` function
     func: unsafe fn(*mut ()),
@@ -11,7 +11,6 @@ pub struct Job{
 // Safety: Each job works on a exclusive slice of memory of a Send + Sync type
 unsafe impl Send for Job {}
 impl Job {
-
     /// Create a new job
     ///
     /// # Safety
@@ -73,23 +72,23 @@ pub trait Backend {
             T: Send,
         {
             // SAFETY: the safety requirements are forwarded to the caller
-            let job = unsafe {(arg.cast::<ParallelizationUnit<'_, F, T, R>>()).as_mut_unchecked()};
+            let job =
+                unsafe { (arg.cast::<ParallelizationUnit<'_, F, T, R>>()).as_mut_unchecked() };
             for row in 0..R {
                 let value = (job.func)(job.col, row);
-                job.output_col[row] = value ;
+                job.output_col[row] = value;
             }
         }
 
         for (c_i, column) in output.iter_mut().enumerate() {
-            let mut job = ParallelizationUnit {func: &func, output_col: column, col: c_i} ;
-            Self::defer_job(
-                unsafe {
-                    Job::new(
-                        worker::<F, T, ROWS>,
-                        (core::ptr::from_mut(&mut job)).cast()
-                    )
-                }
-            );
+            let mut job = ParallelizationUnit {
+                func: &func,
+                output_col: column,
+                col: c_i,
+            };
+            Self::defer_job(unsafe {
+                Job::new(worker::<F, T, ROWS>, (core::ptr::from_mut(&mut job)).cast())
+            });
         }
         Self::wait();
 
